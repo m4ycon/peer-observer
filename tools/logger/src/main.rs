@@ -66,7 +66,8 @@ fn main() {
 
     // TODO: handle unwraps
     let nc = nats::connect(args.nats_address).unwrap();
-    let sub = nc.subscribe("*").unwrap();
+    let js = nats::jetstream::new(nc);
+    let sub = js.subscribe("*").unwrap();
     for msg in sub.messages() {
         if let Ok(event_msg) = event_msg::EventMsg::decode(msg.data.as_slice()) {
             if let Some(event) = event_msg.event {

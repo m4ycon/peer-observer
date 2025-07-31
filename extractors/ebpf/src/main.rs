@@ -259,6 +259,22 @@ fn run() -> Result<(), RuntimeError> {
 
     log::debug!("Connecting to NATS server at {}..", args.nats_address);
     let nc = nats::connect(&args.nats_address)?;
+
+    let js_subjects = vec![
+        Subject::Addrman,
+        Subject::Mempool,
+        Subject::NetMsg,
+        Subject::NetConn,
+        Subject::Validation,
+    ];
+    let js = nats::jetstream::new(nc.clone());
+    js.add_stream(nats::jetstream::StreamConfig {
+        name: "extractor".to_string(),
+        subjects: js_subjects.iter().map(|s| s.to_string()).collect(),
+        storage: nats::jetstream::StorageType::File,
+        ..Default::default()
+    })?;
+
     log::info!("Connected to NATS server at {}", &args.nats_address);
 
     let mut active_tracepoints = vec![];

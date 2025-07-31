@@ -13,3 +13,6 @@ __pycache__
 
 # All csv files
 *.csv
+
+# Nats jetstream store
+store/
