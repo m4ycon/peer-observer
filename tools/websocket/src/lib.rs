@@ -1,5 +1,6 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
+use serde::{Deserialize, Serialize};
 use shared::clap::Parser;
 use shared::futures::{stream::SplitSink, SinkExt, StreamExt};
 use shared::log;
@@ -54,7 +55,8 @@ impl Args {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct ClientSubscriptionsEbpf {
     messages: bool,
     mempool: bool,
@@ -65,7 +67,8 @@ struct ClientSubscriptionsEbpf {
 
 // TODO: we could do this more granular (for more detailed filtering)
 // ClientSubscriptionsEbpf is an example of more detailed filtering
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct ClientSubscriptions {
     ebpf: ClientSubscriptionsEbpf,
     p2p: bool,
@@ -182,12 +185,34 @@ async fn handle_client(
                     }
                     TungsteniteMessage::Text(text) => {
                         log::debug!("Received message from client '{}': {}", addr, text);
-                        // TODO:
-                        // We assume the client is sending us a JSON message constisting of a ClientSubscriptions struct
-                        // Parse it here, and update the subscriptions of the client. This requires locking and updating
-                        // the client.
-                        // If we receive something we can't parse, we should print an error and close the connection to the client.
-                        // This should allow us to catch this in e.g. tests or manual testing of websocket HTML tools.
+                        if text.is_empty() {
+                            clients.lock().await.get_mut(&addr).unwrap().subscriptions = ClientSubscriptions::default();
+                            continue;
+                        }
+
+                        if text.to_lowercase() == "help" {
+                            let default_example = ClientSubscriptions::default();
+                            let help_message = serde_json::to_string(&default_example).unwrap_or_else(|_| "{}".to_string());
+                            if let Some(client) = clients.lock().await.get_mut(&addr) {
+                                if let Err(send_err) = client.outgoing.send(TungsteniteMessage::text(help_message)).await {
+                                    log::warn!("Failed to send help message to client '{}': {}", addr, send_err);
+                                    clients.lock().await.remove(&addr);
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        match serde_json::from_str::<ClientSubscriptions>(&text) {
+                            Ok(subs) => {
+                                clients.lock().await.get_mut(&addr).unwrap().subscriptions = subs;
+                            }
+                            Err(e) => {
+                                log::warn!("Could not parse client subscriptions from message: {text}; Closing connection to client '{addr}'; Error: {e}");
+                                clients.lock().await.remove(&addr);
+                                break;
+                            }
+                        }
                     }
                     _ => (),
                 }
