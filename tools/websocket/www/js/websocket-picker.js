@@ -13,6 +13,19 @@ var g_messageCallback;
 var g_resetCallback;
 var g_ws;
 
+var subscriptions = {
+  ebpf: {
+    messages: false,
+    mempool: false,
+    validation: false,
+    connections: false,
+    addrman: false
+  },
+  p2p: false,
+  log: false,
+  rpc: false
+};
+
 function switchWebsocket(url) {
   // close any eventually existing websockets
   if (g_ws) {
@@ -26,8 +39,18 @@ function switchWebsocket(url) {
   g_ws = new WebSocket(url);
   g_ws.addEventListener("open", (e) => {
     console.log("connection opened to", url, ": ", e);
+    console.log("subscribing with", subscriptions);
+    g_ws.send(JSON.stringify(subscriptions));
   });
   g_ws.addEventListener("message", g_messageCallback);
+}
+
+function updateSubscriptions(newSubscriptions) {
+  subscriptions = newSubscriptions;
+  if (g_ws && g_ws.readyState === WebSocket.OPEN) {
+    console.log("updating subscriptions with", subscriptions);
+    g_ws.send(JSON.stringify(subscriptions));
+  }
 }
 
 function drawWebsocketError(id) {

@@ -337,6 +337,7 @@
   window.onload = (event) => {
     cleanUpClosedPeers()
     runUnitTests()
+    updateSubscriptions({ ebpf: { messages: true, connections: true } })
     initWebsocketPicker("websockets.json", "websocket-picker", processWebsocketMessage, handleWebsocketReset)
   };
 
