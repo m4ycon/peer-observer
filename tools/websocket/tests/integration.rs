@@ -1,28 +1,25 @@
 #![cfg(feature = "nats_integration_tests")]
 
 use shared::{
-    futures::StreamExt,
+    futures::{SinkExt, StreamExt, stream},
     log::{self, warn},
     nats_subjects::Subject,
     nats_util::NatsArgs,
     prost::Message,
-    protobuf::ebpf_extractor::{
-        connection::{self, Connection},
-        ebpf,
-        message::{self, message_event::Msg, Metadata, Ping, Pong},
-        Ebpf,
+    protobuf::{
+        ebpf_extractor::{
+            Ebpf, connection::{self, Connection}, ebpf, mempool::{self, Added}, message::{self, Metadata, Ping, Pong, message_event::Msg}, validation::{self, BlockConnected}
+        },
+        event::{Event, event::PeerObserverEvent},
     },
-    protobuf::event::{event::PeerObserverEvent, Event},
     rand::{self, Rng},
     simple_logger::SimpleLogger,
-    testing::nats_publisher::NatsPublisherForTesting,
-    testing::nats_server::NatsServerForTesting,
+    testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{
-        self,
-        sync::{watch, Mutex},
-        time::sleep,
+        self, sync::{Mutex, watch}, time::{sleep, timeout}
     },
 };
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use std::{
     io::ErrorKind,
@@ -33,7 +30,39 @@ use std::{
     time::Duration,
 };
 
-use websocket::{error::RuntimeError, Args};
+use websocket::{error::RuntimeError, Args, ClientSubscriptions, ClientSubscriptionsEbpf};
+
+const SUBSCRIBE_NONE: &ClientSubscriptions = &ClientSubscriptions {
+    ebpf: ClientSubscriptionsEbpf {
+        messages: false,
+        mempool: false,
+        validation: false,
+        connections: false,
+        addrman: false,
+    },
+    p2p: false,
+    log: false,
+    rpc: false,
+};
+
+const SUBSCRIBE_ALL: &ClientSubscriptions = &ClientSubscriptions {
+    ebpf: ClientSubscriptionsEbpf {
+        messages: true,
+        mempool: true,
+        validation: true,
+        connections: true,
+        addrman: true,
+    },
+    p2p: true,
+    log: true,
+    rpc: true,
+};
+
+#[derive(Debug, Clone)]
+struct ClientConfig {
+    subscriptions: ClientSubscriptions,
+    expected_events: Vec<&'static str>,
+}
 
 static INIT: Once = Once::new();
 
@@ -73,6 +102,119 @@ fn make_test_args(nats_port: u16, websocket_port: u16) -> Args {
         format!("127.0.0.1:{}", websocket_port),
         log::Level::Trace,
     )
+}
+
+async fn publish_and_check_simple(
+    events: &[(Subject, Event)],
+    expected_events: Vec<&'static str>,
+    num_clients: Option<u8>,
+) {
+    let num_clients = num_clients.unwrap_or(1);
+    let clients = vec![
+        ClientConfig {
+            subscriptions: SUBSCRIBE_ALL.clone(),
+            expected_events: expected_events.to_vec(),
+        };
+        num_clients as usize
+    ];
+
+    publish_and_check2(events, clients.as_slice()).await;
+}
+
+async fn publish_and_check2(events: &[(Subject, Event)], clients: &[ClientConfig]) {
+    let initial_websocket_port = setup();
+    let websocket_port: Arc<Mutex<u16>> = Arc::new(Mutex::new(initial_websocket_port));
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let websocket_port_clone = websocket_port.clone();
+    let websocket_handle = tokio::spawn(async move {
+        loop {
+            let port: u16;
+            {
+                port = *websocket_port_clone.lock().await;
+            }
+
+            let args = make_test_args(nats_server.port, port);
+            match websocket::run(args, shutdown_rx.clone()).await {
+                Ok(_) => break,
+                Err(e) => match e {
+                    RuntimeError::Io(e) => match e.kind() {
+                        ErrorKind::AddrInUse => {
+                            let new_port = NEXT_WEBSOCKET_PORT
+                                .get()
+                                .unwrap()
+                                .fetch_add(1, Ordering::SeqCst);
+                            warn!(
+                                "Port {} seems to be already in use. Trying port {} next..",
+                                port, new_port
+                            );
+                            let mut port = websocket_port_clone.lock().await;
+                            *port = new_port;
+                        }
+                        _ => panic!("Couldn not start websocket tool: {}", e),
+                    },
+                    _ => panic!("Couldn not start websocket tool: {}", e),
+                },
+            }
+        }
+    });
+    // allow the websocket tool to start
+    sleep(Duration::from_secs(1)).await;
+
+    let port = websocket_port.lock().await;
+    let mut clients_stream = vec![];
+    for client_config in clients {
+        let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
+            .await
+            .expect("Should be able to connect to websocket");
+        let (mut outgoing, incoming) = ws_stream.split();
+        outgoing
+            .send(TungsteniteMessage::Text(
+                serde_json::to_string(&client_config.subscriptions)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .expect("Should be able to send subscription message");
+        clients_stream.push((outgoing, incoming));
+    }
+
+    for (subject, event) in events.iter() {
+        log::debug!("publishing: {:?}", event);
+        nats_publisher
+            .publish(subject.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    stream::iter(clients_stream)
+      .enumerate()
+      .map(async |(i, (_, ref mut incoming))| {
+        let mut messages = vec![];
+        timeout(Duration::from_secs(1), async {
+            while let Some(msg) = incoming.next().await {
+                messages.push(msg.unwrap());
+            }
+        })
+        .await
+        .unwrap_or_else(|_| ());
+
+        let client_config = &clients[i];
+        assert_eq!(client_config.expected_events.len(), messages.len()); // not less, not more
+
+        for (i, expected) in client_config.expected_events.iter().enumerate() {
+            let msg = &messages[i];
+            assert_eq!(*expected, msg.to_string());
+        }
+      })
+      .buffer_unordered(clients.len())
+      .collect::<Vec<_>>()
+      .await;
+
+    shutdown_tx.send(true).unwrap();
+    websocket_handle.await.unwrap();
 }
 
 async fn publish_and_check(
@@ -130,7 +272,14 @@ async fn publish_and_check(
         let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
             .await
             .expect("Should be able to connect to websocket");
-        clients.push(ws_stream)
+        let (mut outgoing, incoming) = ws_stream.split();
+        outgoing
+            .send(TungsteniteMessage::Text(
+                serde_json::to_string(SUBSCRIBE_ALL).unwrap().into(),
+            ))
+            .await
+            .expect("Should be able to send subscription message");
+        clients.push((outgoing, incoming));
     }
 
     for event in events.iter() {
@@ -142,7 +291,8 @@ async fn publish_and_check(
 
     if let Some(idx) = disconnect_client {
         clients[idx as usize]
-            .close(None)
+            .0
+            .close()
             .await
             .expect("Should be able to close a client");
     }
@@ -150,7 +300,7 @@ async fn publish_and_check(
     sleep(Duration::from_millis(100)).await;
 
     assert_eq!(events.len(), expected.len());
-    for (i, client) in clients.iter_mut().enumerate() {
+    for (i, (_, incoming)) in clients.iter_mut().enumerate() {
         if let Some(idx) = disconnect_client {
             // if we closed this client, we can skip it here as we don't expect it to have all events
             if i == idx as usize {
@@ -158,7 +308,7 @@ async fn publish_and_check(
             }
         }
         for expected in expected.iter() {
-            if let Some(msg) = client.next().await {
+            if let Some(msg) = incoming.next().await {
                 let msg = msg.unwrap();
                 println!("data: {}", msg);
                 assert_eq!(*expected, msg.to_string());
@@ -174,31 +324,42 @@ async fn publish_and_check(
 async fn test_integration_websocket_conn_inbound() {
     println!("test that inbound connections work");
 
-    publish_and_check(&[Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
-        ebpf_event: Some(ebpf::EbpfEvent::Connection(connection::ConnectionEvent {
-            event: Some(connection::connection_event::Event::Inbound(
-                connection::InboundConnection {
-                    conn: Connection {
-                        addr: "127.0.0.1:8333".to_string(),
-                        conn_type: 1,
-                        network: 2,
-                        peer_id: 7,
-                    },
-                    existing_connections: 123,
-                },
-            )),
-        }))
-    }))
-    .unwrap()], Subject::NetConn, &[r#"{"EbpfExtractor":{"ebpf_event":{"Connection":{"event":{"Inbound":{"conn":{"peer_id":7,"addr":"127.0.0.1:8333","conn_type":1,"network":2},"existing_connections":123}}}}}}"#],1, None).await;
+    publish_and_check2(
+        &[(
+            Subject::NetConn,
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Connection(connection::ConnectionEvent {
+                    event: Some(connection::connection_event::Event::Inbound(
+                        connection::InboundConnection {
+                            conn: Connection {
+                                addr: "127.0.0.1:8333".to_string(),
+                                conn_type: 1,
+                                network: 2,
+                                peer_id: 7,
+                            },
+                            existing_connections: 123,
+                        },
+                    )),
+                })),
+            }))
+            .unwrap(),
+        )],
+        &[ClientConfig {
+            subscriptions: SUBSCRIBE_ALL.clone(),
+            expected_events: vec![
+                r#"{"EbpfExtractor":{"ebpf_event":{"Connection":{"event":{"Inbound":{"conn":{"peer_id":7,"addr":"127.0.0.1:8333","conn_type":1,"network":2},"existing_connections":123}}}}}}"#,
+            ],
+        }],
+    );
 }
 
 #[tokio::test]
 async fn test_integration_websocket_p2p_message_ping() {
     println!("test that the P2P message via websockets work");
 
-    publish_and_check(
+    publish_and_check2(
         &[
-            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+            (Subject::NetMsg, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
                 ebpf_event: Some(ebpf::EbpfEvent::Message(message::MessageEvent  {
                     meta: Metadata {
                         peer_id: 0,
@@ -211,8 +372,8 @@ async fn test_integration_websocket_p2p_message_ping() {
                     msg: Some(Msg::Ping(Ping { value: 1 })),
                 }))
             }))
-            .unwrap(),
-            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+            .unwrap()),
+            (Subject::NetMsg, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
                 ebpf_event: Some(ebpf::EbpfEvent::Message(message::MessageEvent  {
                     meta: Metadata {
                         peer_id: 0,
@@ -225,13 +386,16 @@ async fn test_integration_websocket_p2p_message_ping() {
                     msg: Some(Msg::Pong(Pong { value: 1 })),
                 }))
             }))
-            .unwrap(),
+            .unwrap(),)
         ],
-        Subject::NetMsg,
-        &[r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"ping","inbound":true,"size":8},"msg":{"Ping":{"value":1}}}}}}"#,
-            r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"pong","inbound":false,"size":8},"msg":{"Pong":{"value":1}}}}}}"#],
-        1,
-        None
+        &[
+          ClientConfig {
+              subscriptions: SUBSCRIBE_ALL.clone(),
+              expected_events: vec![
+                  r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"ping","inbound":true,"size":8},"msg":{"Ping":{"value":1}}}}}}"#,
+                  r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"pong","inbound":false,"size":8},"msg":{"Pong":{"value":1}}}}}}"#],
+          },
+        ]
     )
     .await;
 }
@@ -240,9 +404,9 @@ async fn test_integration_websocket_p2p_message_ping() {
 async fn test_integration_websocket_multi_client() {
     println!("test that multiple clients all receive the messages");
 
-    publish_and_check(
+    publish_and_check_simple(
         &[
-            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+            (Subject::NetMsg, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
                 ebpf_event: Some(ebpf::EbpfEvent::Message(message::MessageEvent  {
                     meta: Metadata {
                         peer_id: 0,
@@ -255,8 +419,8 @@ async fn test_integration_websocket_multi_client() {
                     msg: Some(Msg::Ping(Ping { value: 1 })),
                 }))
             }))
-            .unwrap(),
-            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+            .unwrap()),
+            (Subject::NetMsg, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
                 ebpf_event: Some(ebpf::EbpfEvent::Message(message::MessageEvent  {
                     meta: Metadata {
                         peer_id: 0,
@@ -269,13 +433,11 @@ async fn test_integration_websocket_multi_client() {
                     msg: Some(Msg::Pong(Pong { value: 1 })),
                 }))
             }))
-            .unwrap(),
+            .unwrap()),
         ],
-        Subject::NetMsg,
-        &[r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"ping","inbound":true,"size":8},"msg":{"Ping":{"value":1}}}}}}"#,
+        vec![r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"ping","inbound":true,"size":8},"msg":{"Ping":{"value":1}}}}}}"#,
             r#"{"EbpfExtractor":{"ebpf_event":{"Message":{"meta":{"peer_id":0,"addr":"127.0.0.1:8333","conn_type":1,"command":"pong","inbound":false,"size":8},"msg":{"Pong":{"value":1}}}}}}"#],
-        12,
-        None
+        Some(12),
     )
     .await;
 }
@@ -307,6 +469,55 @@ async fn test_integration_websocket_closed_client() {
         &[r#"{"EbpfExtractor":{"ebpf_event":{"Connection":{"event":{"Outbound":{"conn":{"peer_id":11,"addr":"1.1.1.1:48333","conn_type":2,"network":3},"existing_connections":321}}}}}}"#],
         4,
         Some(2)
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_integration_websocket_specific_subjects() {
+    println!("test that we can subscribe to specific subjects and only receive those events");
+
+    let mut subscriptions = SUBSCRIBE_NONE.clone();
+    subscriptions.ebpf.mempool = true;
+
+    publish_and_check2(
+        &[
+            (Subject::Mempool, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Mempool(mempool::MempoolEvent {
+                    event: Some(mempool::mempool_event::Event::Added(Added {
+                        txid: vec![76, 70, 231],
+                        vsize: 175,
+                        fee: 358,
+                    })),
+                }))
+            }))
+            .unwrap()),
+            (Subject::Validation, Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Validation(validation::ValidationEvent {
+                    event: Some(validation::validation_event::Event::BlockConnected(BlockConnected {
+                        hash: vec![1, 2, 3, 4, 5],
+                        height: 800000,
+                        transactions: 2500,
+                        inputs: 5000,
+                        sigops: 20000,
+                        connection_time: 1500000000,
+                    })),
+                }))
+            }))
+            .unwrap()),
+        ],
+        &[
+              ClientConfig {
+                  subscriptions: subscriptions,
+                  expected_events: vec![
+                      r#"{"EbpfExtractor":{"ebpf_event":{"Mempool":{"event":{"Added":{"txid":[76,70,231],"vsize":175,"fee":358}}}}}}"#,
+                  ],
+              },
+              ClientConfig {
+                  subscriptions: SUBSCRIBE_NONE.clone(),
+                  expected_events: vec![],
+              },
+        ]
     )
     .await;
 }

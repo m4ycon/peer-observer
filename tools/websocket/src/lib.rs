@@ -55,7 +55,7 @@ impl Args {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct ClientSubscriptionsEbpf {
     pub messages: bool,
@@ -67,7 +67,7 @@ pub struct ClientSubscriptionsEbpf {
 
 // TODO: we could do this more granular (for more detailed filtering)
 // ClientSubscriptionsEbpf is an example of more detailed filtering
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct ClientSubscriptions {
     pub ebpf: ClientSubscriptionsEbpf,
