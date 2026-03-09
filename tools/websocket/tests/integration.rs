@@ -241,6 +241,75 @@ async fn publish_and_check(events: &[(Subject, Event)], clients: &[ClientConfig]
     websocket_handle.await.unwrap();
 }
 
+async fn custom_message_check(message: &str) {
+    let initial_websocket_port = setup();
+    let websocket_port: Arc<Mutex<u16>> = Arc::new(Mutex::new(initial_websocket_port));
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let websocket_port_clone = websocket_port.clone();
+    let websocket_handle = tokio::spawn(async move {
+        loop {
+            let port: u16;
+            {
+                port = *websocket_port_clone.lock().await;
+            }
+
+            let args = make_test_args(nats_server.port, port);
+            match websocket::run(args, shutdown_rx.clone()).await {
+                Ok(_) => break,
+                Err(e) => match e {
+                    RuntimeError::Io(e) => match e.kind() {
+                        ErrorKind::AddrInUse => {
+                            let new_port = NEXT_WEBSOCKET_PORT
+                                .get()
+                                .unwrap()
+                                .fetch_add(1, Ordering::SeqCst);
+                            warn!(
+                                "Port {} seems to be already in use. Trying port {} next..",
+                                port, new_port
+                            );
+                            let mut port = websocket_port_clone.lock().await;
+                            *port = new_port;
+                        }
+                        _ => panic!("Couldn not start websocket tool: {}", e),
+                    },
+                    _ => panic!("Couldn not start websocket tool: {}", e),
+                },
+            }
+        }
+    });
+    // allow the websocket tool to start
+    sleep(Duration::from_secs(1)).await;
+
+    let port = websocket_port.lock().await;
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
+        .await
+        .expect("Should be able to connect to websocket");
+    let (mut outgoing, mut incoming) = ws_stream.split();
+
+    outgoing
+        .send(TungsteniteMessage::Text(message.into()))
+        .await
+        .expect("Should be able to send custom message");
+
+    let msg = incoming
+        .next()
+        .await
+        .expect("No message received")
+        .expect("Error in message");
+    assert!(
+        matches!(msg, TungsteniteMessage::Close(_)),
+        "Expected Close message, got {:?}",
+        msg
+    );
+
+    shutdown_tx.send(true).unwrap();
+    websocket_handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_integration_websocket_conn_inbound() {
     println!("test that inbound connections work");
@@ -462,4 +531,12 @@ async fn test_integration_websocket_specific_subjects() {
         ]
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_integration_websocket_invalid_message_disconnect() {
+    println!("Check that we disconnect on invalid, empty, and large messages");
+    custom_message_check("").await;
+    custom_message_check("aaaaaaa").await;
+    custom_message_check(&"a".repeat(513)).await;
 }

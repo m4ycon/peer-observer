@@ -182,25 +182,35 @@ async fn handle_client(
                         break;
                     }
                     TungsteniteMessage::Text(text) => {
-                        log::debug!("Received message from client '{}': {}", addr, text);
-                        if text.is_empty() {
-                            if let Some(client) = clients.lock().await.get_mut(&addr) {
-                                client.outgoing.close().await?;
+                        let truncated_text: String = text.chars().take(100).collect();
+                        match text.len() {
+                            0 => {
+                                log::warn!(
+                                    "Received empty message from client {addr}. Disconnecting."
+                                )
                             }
-                            clients.lock().await.remove(&addr);
-                            continue;
-                        }
+                            1..512 => match serde_json::from_str::<ClientSubscriptions>(&text) {
+                                Ok(subs) => {
+                                    clients.lock().await.get_mut(&addr).unwrap().subscriptions =
+                                        subs;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::warn!("Could not parse client subscriptions from message: '{truncated_text}'; Disconnecting '{addr}' due to error: {e}");
+                                }
+                            },
+                            512.. => {
+                                log::warn!(
+                                    "Received large message '{truncated_text}..' from client {addr}. Disconnecting."
+                                );
+                            }
+                        };
 
-                        match serde_json::from_str::<ClientSubscriptions>(&text) {
-                            Ok(subs) => {
-                                clients.lock().await.get_mut(&addr).unwrap().subscriptions = subs;
-                            }
-                            Err(e) => {
-                                log::warn!("Could not parse client subscriptions from message: {text}; Closing connection to client '{addr}'; Error: {e}");
-                                clients.lock().await.remove(&addr);
-                                break;
-                            }
+                        // if we didn't continue above, we should close the connection to
+                        if let Some(client) = clients.lock().await.get_mut(&addr) {
+                            client.outgoing.close().await?;
                         }
+                        clients.lock().await.remove(&addr);
                     }
                     _ => (),
                 }
