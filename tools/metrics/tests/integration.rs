@@ -30,8 +30,9 @@ use shared::{
         p2p_extractor,
         rpc_extractor::{
             self, AddrManInfo, AddrManInfoNetwork, Addrman, AddrmanBucket, AddrmanEntry,
-            BlockchainInfo, ChainTxStats, MemoryInfo, MempoolInfo, NetTotals, NetworkInfo,
-            NetworkInfoNetwork, OrphanTx, OrphanTxs, PeerInfo, PeerInfos, UploadTarget,
+            BlockchainInfo, ChainTxStats, EstimateSmartFee, FeeEstimateMode, MemoryInfo,
+            MempoolInfo, NetTotals, NetworkInfo, NetworkInfoNetwork, OrphanTx, OrphanTxs, PeerInfo,
+            PeerInfos, UploadTarget,
         },
     },
     rand::{self, Rng},
@@ -3712,6 +3713,42 @@ async fn test_integration_metrics_rpc_getorphantxs() {
             peerobserver_rpc_getorphantxs_from_min 1
             peerobserver_rpc_getorphantxs_from_max 2
             peerobserver_rpc_getorphantxs_from_mean 1.5
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_integration_metrics_rpc_estimatesmartfee() {
+    println!("test that the estimatesmartfee metrics work");
+
+    publish_and_check(
+        &[
+            Event::new(PeerObserverEvent::RpcExtractor(rpc_extractor::Rpc {
+                rpc_event: Some(rpc_extractor::rpc::RpcEvent::EstimateSmartFee(
+                    EstimateSmartFee {
+                        fee_rate: 1.08,
+                        blocks: 144,
+                        mode: FeeEstimateMode::Economical.into(),
+                    },
+                )),
+            }))
+            .unwrap(),
+            Event::new(PeerObserverEvent::RpcExtractor(rpc_extractor::Rpc {
+                rpc_event: Some(rpc_extractor::rpc::RpcEvent::EstimateSmartFee(
+                    EstimateSmartFee {
+                        fee_rate: 0.777,
+                        blocks: 6,
+                        mode: FeeEstimateMode::Conservative.into(),
+                    },
+                )),
+            }))
+            .unwrap(),
+        ],
+        Subject::Rpc,
+        r#"
+            peerobserver_rpc_estimatesmartfee_feerate{mode="CONSERVATIVE",target_block="6"} 0.777
+            peerobserver_rpc_estimatesmartfee_feerate{mode="ECONOMICAL",target_block="144"} 1.08
         "#,
     )
     .await;
