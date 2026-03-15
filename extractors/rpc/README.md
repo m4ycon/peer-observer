@@ -69,6 +69,8 @@ Options:
           Disable querying and publishing of `getorphantxs` data
       --disable-getrawaddrman
           Disable querying and publishing of `getrawaddrman` data
+      --disable-getestimatesmartfee
+          Disable querying and publishing of `estimatesmartfee` data
   -h, --help
           Print help
   -V, --version

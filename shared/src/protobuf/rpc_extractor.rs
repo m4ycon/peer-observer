@@ -4,10 +4,10 @@ use bitcoin::FeeRate;
 // Once they have a model, move them down to the mtypes!
 // CORE_VERSION_GREP: When updating the corepc node crate version, bump this too.
 use corepc_client::types::v30::{
-    AddrManInfoNetwork as RPCAddrManInfoNetwork, GetAddrManInfo as RPCGetAddrManInfo,
-    GetMemoryInfoStats as RPCGetMemoryInfoStats, GetNetTotals as RPCGetNetTotals,
-    GetPeerInfo as RPCGetPeerInfo, GetRawAddrMan, PeerInfo as RPCPeerInfo, RawAddrManEntry,
-    UploadTarget as RPCUploadTarget,
+    AddrManInfoNetwork as RPCAddrManInfoNetwork, EstimateSmartFee as RPCEstimateSmartFee,
+    GetAddrManInfo as RPCGetAddrManInfo, GetMemoryInfoStats as RPCGetMemoryInfoStats,
+    GetNetTotals as RPCGetNetTotals, GetPeerInfo as RPCGetPeerInfo, GetRawAddrMan,
+    PeerInfo as RPCPeerInfo, RawAddrManEntry, UploadTarget as RPCUploadTarget,
 };
 
 // Ideally, all type imports should use the generic mtype types.
@@ -68,6 +68,7 @@ impl fmt::Display for rpc::RpcEvent {
             rpc::RpcEvent::BlockchainInfo(info) => write!(f, "{}", info),
             rpc::RpcEvent::OrphanTxs(orphans) => write!(f, "{}", orphans),
             rpc::RpcEvent::Addrman(addrman) => write!(f, "{}", addrman),
+            rpc::RpcEvent::EstimateSmartFee(fee) => write!(f, "{}", fee),
         }
     }
 }
@@ -534,6 +535,38 @@ impl From<GetRawAddrMan> for Addrman {
         Addrman {
             new: table_to_addrman_buckets(&addrman.new),
             tried: table_to_addrman_buckets(&addrman.tried),
+        }
+    }
+}
+
+impl fmt::Display for EstimateSmartFee {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mode = FeeEstimateMode::try_from(self.mode)
+            .expect("Estimate mode must be a valid FeeEstimateMode enum variant");
+
+        write!(
+            f,
+            "EstimateSmartFee(fee_rate={}sat/vB, blocks={}, mode={})",
+            self.fee_rate, self.blocks, mode,
+        )
+    }
+}
+
+impl fmt::Display for FeeEstimateMode {
+    fn fmt(&self, estimate: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(estimate, "{}", self.as_str_name())
+    }
+}
+
+impl From<RPCEstimateSmartFee> for EstimateSmartFee {
+    fn from(estimate: RPCEstimateSmartFee) -> Self {
+        let fee_rate_btc_per_kvb = estimate.fee_rate.unwrap_or(0.);
+        let fee_rate_sat_per_vb = fee_rate_btc_per_kvb * 1e8 / 1e3;
+
+        EstimateSmartFee {
+            fee_rate: fee_rate_sat_per_vb,
+            blocks: estimate.blocks,
+            mode: FeeEstimateMode::default().into(),
         }
     }
 }
