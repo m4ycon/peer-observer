@@ -27,7 +27,7 @@ pub trait FeeRateExt {
 
 impl FeeRateExt for bitcoin::FeeRate {
     fn to_sat_per_vb_f64(self) -> f64 {
-        self.to_sat_per_kwu() as f64 / 1000.0 / 4.0
+        self.to_sat_per_kwu() as f64 / (1000.0 / 4.0)
     }
 }
 
