@@ -40,6 +40,7 @@ use shared::{
         metrics_fetcher::fetch_metrics_root, nats_publisher::NatsPublisherForTesting,
         nats_server::NatsServerForTesting,
     },
+    time,
     tokio::{
         self,
         sync::{watch, Mutex},
@@ -3764,6 +3765,137 @@ async fn test_integration_metrics_rpc_estimatesmartfee() {
         r#"
             peerobserver_rpc_estimatesmartfee_feerate{mode="CONSERVATIVE",target_block="6"} 0.777
             peerobserver_rpc_estimatesmartfee_feerate{mode="ECONOMICAL",target_block="144"} 1.08
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_integration_metrics_compact_block_reconstruction_requested_bytes() {
+    println!("test that log-extractor compact block reconstruction requested bytes metric work");
+
+    publish_and_check(
+        &[
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: 1234,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 4,
+                log_event: Some(log_extractor::log::LogEvent::CompactBlockReconstructedLog(
+                    log_extractor::CompactBlockReconstructedLog {
+                        block_hash:
+                            "000000000000000000015b62bd7219241b46793581d92e7df8ff11397b4e6f1b"
+                                .to_string(),
+                        prefilled_txn_count: 1,
+                        mempool_txn_count: 396,
+                        extra_pool_txn_count: 0,
+                        requested_txn_count: 0,
+                        requested_txn_bytes: 777,
+                    },
+                )),
+            }))
+            .unwrap(),
+        ],
+        Subject::LogExtractor,
+        r#"
+        peerobserver_log_compact_block_reconstruction_requested_bytes 777
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_integration_metrics_compact_block_reconstruction_time_and_count() {
+    println!("test that log-extractor compact block reconstruction time and count metrics work");
+
+    let now_microsec = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000) as u64;
+
+    publish_and_check(
+        &[
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: now_microsec + 77777,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 4,
+                log_event: Some(log_extractor::log::LogEvent::CompactBlockReconstructedLog(
+                    log_extractor::CompactBlockReconstructedLog {
+                        block_hash:
+                            "000000000000000000015b62bd7219241b46793581d92e7df8ff11397b4e6f1b"
+                                .to_string(),
+                        prefilled_txn_count: 1,
+                        mempool_txn_count: 396,
+                        extra_pool_txn_count: 0,
+                        requested_txn_count: 1,
+                        requested_txn_bytes: 777,
+                    },
+                )),
+            }))
+            .unwrap(),
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: now_microsec,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 4,
+                log_event: Some(log_extractor::log::LogEvent::SawNewHeaderLog(
+                    log_extractor::SawNewHeaderLog {
+                        block_hash:
+                            "000000000000000000015b62bd7219241b46793581d92e7df8ff11397b4e6f1b"
+                                .to_string(),
+                        block_height: 944942,
+                        peer_id: 30350,
+                        is_cmpctblock: true,
+                    },
+                )),
+            }))
+            .unwrap(),
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: now_microsec + 37703,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 4,
+                log_event: Some(log_extractor::log::LogEvent::CompactBlockReconstructedLog(
+                    log_extractor::CompactBlockReconstructedLog {
+                        block_hash:
+                            "00000000000000000000f8a34d18b93b9385019b57ec13896f8c18a1d4d0d853"
+                                .to_string(),
+                        prefilled_txn_count: 1,
+                        mempool_txn_count: 396,
+                        extra_pool_txn_count: 0,
+                        requested_txn_count: 1,
+                        requested_txn_bytes: 777,
+                    },
+                )),
+            }))
+            .unwrap(),
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: now_microsec,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 4,
+                log_event: Some(log_extractor::log::LogEvent::SawNewHeaderLog(
+                    log_extractor::SawNewHeaderLog {
+                        block_hash:
+                            "00000000000000000000f8a34d18b93b9385019b57ec13896f8c18a1d4d0d853"
+                                .to_string(),
+                        block_height: 944942,
+                        peer_id: 30350,
+                        is_cmpctblock: false,
+                    },
+                )),
+            }))
+            .unwrap(),
+        ],
+        Subject::LogExtractor,
+        r#"
+        peerobserver_log_compact_block_reconstruction_time{bandwidth="low",tx_requested="true"} 37703
+        peerobserver_log_compact_block_reconstruction_time{bandwidth="high",tx_requested="true"} 77777
+        peerobserver_log_compact_block_reconstruction_count{bandwidth="low",tx_requested="true"} 1
+        peerobserver_log_compact_block_reconstruction_count{bandwidth="high",tx_requested="true"} 1
         "#,
     )
     .await;
