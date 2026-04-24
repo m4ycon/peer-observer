@@ -13,6 +13,7 @@ pub extern crate prost;
 pub extern crate rand;
 pub extern crate serde;
 pub extern crate simple_logger;
+pub extern crate time;
 pub extern crate tokio;
 
 /// Mappings and implementation for the protobuf types used in NATS

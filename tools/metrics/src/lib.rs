@@ -25,7 +25,7 @@ use shared::protobuf::{
 };
 use shared::tokio::sync::watch;
 use shared::util::{self, is_on_linkinglion_banlist};
-use shared::{async_nats, clap};
+use shared::{async_nats, clap, time};
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,16 @@ impl Args {
     }
 }
 
+/// Compact block reconstruction state tracking
+#[derive(Clone, Default, Debug)]
+struct CompactBlockReconstruction {
+    started_at_microsec: Option<u64>,
+    ended_at_microsec: Option<u64>,
+    requested_txn_count: u32,
+    bandwidth_mode: Option<String>,
+    created_at: i64,
+}
+
 /// State that's between processing events.
 /// This allows tracking differences between two statefull events.
 #[derive(Default, Debug)]
@@ -74,6 +84,9 @@ struct State {
     // Map of wtxid to bytes
     orphanage: HashMap<String, u64>,
     addrman: Addrman,
+
+    // block hash to compact block reconstruction state
+    compact_block_reconstruction: HashMap<String, CompactBlockReconstruction>,
 }
 
 /// runs the metrics tool
@@ -163,7 +176,7 @@ fn handle_event(
                 }
             }
             PeerObserverEvent::LogExtractor(l) => {
-                handle_log_event(&l, metrics);
+                handle_log_event(&l, state_arc, metrics);
             }
         }
     }
@@ -1425,7 +1438,7 @@ fn handle_p2p_message(msg: &message::MessageEvent, timestamp_ms: u64, metrics: m
     }
 }
 
-fn handle_log_event(log: &Log, metrics: metrics::Metrics) {
+fn handle_log_event(log: &Log, state_arc: Arc<Mutex<State>>, metrics: metrics::Metrics) {
     let category = LogDebugCategory::try_from(log.category)
         .unwrap_or(LogDebugCategory::Unknown)
         .as_str_name()
@@ -1463,5 +1476,84 @@ fn handle_log_event(log: &Log, metrics: metrics::Metrics) {
                     .inc();
             }
         }
+        log::LogEvent::SawNewHeaderLog(block) => {
+            handle_compact_block_reconstruction_state(
+                block.block_hash.clone(),
+                |reconstruction| {
+                    reconstruction.started_at_microsec = Some(log.log_timestamp);
+                    reconstruction.bandwidth_mode = if block.is_cmpctblock {
+                        Some("high".to_string())
+                    } else {
+                        Some("low".to_string())
+                    };
+                },
+                state_arc.clone(),
+                metrics.clone(),
+            );
+        }
+        log::LogEvent::CompactBlockReconstructedLog(block) => {
+            handle_compact_block_reconstruction_state(
+                block.block_hash.clone(),
+                |reconstruction| {
+                    reconstruction.ended_at_microsec = Some(log.log_timestamp);
+                    reconstruction.requested_txn_count = block.requested_txn_count;
+                },
+                state_arc.clone(),
+                metrics.clone(),
+            );
+
+            metrics
+                .log_compact_block_reconstruction_requested_bytes
+                .set(block.requested_txn_bytes.into());
+        }
     }
+}
+
+fn handle_compact_block_reconstruction_state(
+    block_hash: String,
+    update_reconstruction: impl FnOnce(&mut CompactBlockReconstruction),
+    state_arc: Arc<Mutex<State>>,
+    metrics: metrics::Metrics,
+) {
+    let mut state = state_arc.lock().expect("should be able to lock state_arc");
+    let reconstruction = state
+        .compact_block_reconstruction
+        .entry(block_hash.clone())
+        .or_insert_with(|| {
+            let now_secs = time::OffsetDateTime::now_utc().unix_timestamp();
+            CompactBlockReconstruction {
+                created_at: now_secs,
+                ..Default::default()
+            }
+        });
+
+    update_reconstruction(reconstruction);
+
+    if let (Some(start), Some(end), Some(bandwidth_mode)) = (
+        reconstruction.started_at_microsec,
+        reconstruction.ended_at_microsec,
+        reconstruction.bandwidth_mode.clone(),
+    ) {
+        let tx_requested = reconstruction.requested_txn_count > 0;
+        let tx_requested_label = if tx_requested { "true" } else { "false" };
+        let duration_microsec = end.saturating_sub(start);
+
+        metrics
+            .log_compact_block_reconstruction_count
+            .with_label_values(&[tx_requested_label, &bandwidth_mode])
+            .inc();
+        metrics
+            .log_compact_block_reconstruction_time
+            .with_label_values(&[tx_requested_label, &bandwidth_mode])
+            .set(duration_microsec as i64);
+        state.compact_block_reconstruction.remove(&block_hash);
+    }
+
+    // TODO: add a test for this, we need to mock "now"
+    // if entries are older than 5 minutes, remove them to avoid unbounded
+    // growth of the hashmap in case of missing events
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    state
+        .compact_block_reconstruction
+        .retain(|_, reconstruction| now <= reconstruction.created_at + 5 * 60);
 }
