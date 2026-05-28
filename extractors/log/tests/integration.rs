@@ -220,9 +220,10 @@ async fn check(
 
         let args = make_test_args(nats_port, pipe_path.to_string());
 
-        log_extractor::run(args, shutdown_rx.clone())
+        let mut log_extractor = log_extractor::LogExtractor::new(args, shutdown_rx.clone())
             .await
-            .expect("log extractor failed");
+            .unwrap();
+        log_extractor.run().await.expect("log extractor failed");
     });
 
     // End-to-end pipeline handshake: write a unique marker into debug.log
