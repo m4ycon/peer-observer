@@ -3,7 +3,7 @@ use shared::async_nats::{self};
 use shared::clap;
 use shared::clap::Parser;
 use shared::log;
-use shared::log_matchers::parse_log_event;
+use shared::log_matchers::parser::parse_log_event;
 use shared::nats_subjects::Subject;
 use shared::nats_util;
 use shared::prost::Message;
